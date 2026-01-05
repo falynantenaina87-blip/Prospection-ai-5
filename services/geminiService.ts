@@ -1,111 +1,103 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { Lead, EnrichedData } from "../types";
 
+/**
+ * Initialise le client Google AI avec la clé d'environnement.
+ * Sur Vercel, assurez-vous d'ajouter API_KEY dans les Environment Variables.
+ */
 const getAiClient = () => {
-  // Use process.env.API_KEY directly as per guidelines
-  return new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY || "";
+  return new GoogleGenerativeAI(apiKey);
 };
 
 /**
- * Uses Gemini with Google Maps Grounding to find business leads.
+ * Recherche des prospects en utilisant Gemini avec Grounding (Google Search).
  */
 export const searchLeads = async (activity: string, city: string): Promise<Lead[]> => {
-  const ai = getAiClient();
-  const model = "gemini-2.5-flash";
+  const genAI = getAiClient();
+  // Utilisation de gemini-1.5-flash pour la rapidité et le coût
+  const model = genAI.getGenerativeModel({ 
+    model: "gemini-1.5-flash" 
+  });
   
-  const prompt = `Find 10 popular places for "${activity}" in "${city}". List them.`;
+  const prompt = `Trouve 10 entreprises réelles pour l'activité "${activity}" à "${city}". 
+  Pour chaque entreprise, donne : nom, adresse complète, et si possible un site web.
+  Réponds uniquement sous forme de tableau JSON d'objets avec les clés : name, address, website.`;
 
   try {
-    const response = await ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        tools: [{ googleMaps: {} }],
-        temperature: 0.7,
-      },
+    const result = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      tools: [{ googleSearchRetrieval: {} }] // Active la recherche Google en temps réel
     });
 
-    const leads: Lead[] = [];
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    const response = await result.response;
+    const text = response.text();
     
-    if (chunks) {
-      chunks.forEach((chunk, index) => {
-        const c = chunk as any; 
-        
-        if (c.maps) {
-           leads.push({
-             id: c.maps.placeId || `lead-${index}-${Date.now()}`,
-             name: c.maps.title || "Unknown Business",
-             address: c.maps.address || "Address not available",
-             mapUri: c.maps.uri,
-             status: 'discovered'
-           });
-        }
-      });
-    }
+    // Nettoyage pour s'assurer qu'on ne garde que le JSON
+    const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const rawLeads = JSON.parse(cleanJson);
 
-    const uniqueLeads = Array.from(new Map(leads.map(item => [item.id, item])).values());
-    return uniqueLeads;
+    return rawLeads.map((l: any, index: number) => ({
+      id: `lead-${index}-${Date.now()}`,
+      name: l.name || "Inconnu",
+      address: l.address || "Adresse non listée",
+      website: l.website || "",
+      status: 'discovered'
+    }));
 
   } catch (error) {
     console.error("Error searching leads:", error);
-    throw error;
+    return [];
   }
 };
 
 /**
- * Uses Gemini to act as a Digital Strategy Expert.
+ * Analyse un prospect pour générer une stratégie digitale personnalisée.
  */
 export const enrichLeadWithAI = async (lead: Lead, activity: string): Promise<EnrichedData> => {
-  const ai = getAiClient();
-  const model = "gemini-2.5-flash";
+  const genAI = getAiClient();
+  
+  // Configuration du modèle avec un schéma de réponse strict pour éviter les erreurs de parsing
+  const model = genAI.getGenerativeModel({ 
+    model: "gemini-1.5-flash",
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: SchemaType.OBJECT,
+        properties: {
+          website: { type: SchemaType.STRING },
+          email: { type: SchemaType.STRING },
+          isMobileFriendly: { type: SchemaType.BOOLEAN },
+          weakness: { type: SchemaType.STRING },
+          pitch: { type: SchemaType.STRING },
+        },
+        required: ["website", "email", "isMobileFriendly", "weakness", "pitch"],
+      },
+    }
+  });
 
-  // Prompt spécifique demandé par l'expert Full-Stack
   const expertPrompt = `
-    En tant qu'expert en stratégie digitale, analyse les données suivantes pour l'entreprise "${lead.name}" située à "${lead.address}".
-    
-    1. Trouve leur site web et email officiel (via Google Search).
-    2. Analyse les données : {nom: "${lead.name}", site: [Trouvé ou Inconnu], note: "${lead.rating || 'N/A'}"}.
-    3. Identifie un point faible technique précis (ex: vitesse, SEO, responsive, absence de site).
-    4. Rédige un pitch de vente de 2 phrases percutantes pour proposer une refonte ou une amélioration.
-
-    Format de réponse attendu : JSON uniquement.
+    En tant qu'expert en stratégie digitale, analyse l'entreprise "${lead.name}" à "${lead.address}" (${activity}).
+    1. Identifie leur présence en ligne (site et email).
+    2. Trouve un point faible technique (SEO, responsive, absence de site).
+    3. Rédige un pitch de vente percutant de 2 phrases.
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model,
-      contents: expertPrompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            website: { type: Type.STRING, description: "URL du site ou 'Not found'" },
-            email: { type: Type.STRING, description: "Email public ou 'Not found'" },
-            isMobileFriendly: { type: Type.BOOLEAN, description: "Estimation mobile-friendly" },
-            weakness: { type: Type.STRING, description: "Le point faible technique identifié" },
-            pitch: { type: Type.STRING, description: "Le pitch de vente de 2 phrases" },
-          },
-          required: ["website", "email", "isMobileFriendly", "weakness", "pitch"],
-        },
-      },
-    });
-
-    const text = response.text || "{}";
-    const data = JSON.parse(text) as EnrichedData;
-    
-    return data;
+    const result = await model.generateContent(expertPrompt);
+    const text = result.response.text();
+    return JSON.parse(text) as EnrichedData;
 
   } catch (error) {
     console.error(`Error enriching lead ${lead.name}:`, error);
     return {
-      website: "N/A",
+      website: lead.website || "N/A",
       email: "N/A",
       isMobileFriendly: false,
-      weakness: "Erreur d'analyse",
-      pitch: "Impossible d'analyser ce prospect pour le moment. Une vérification manuelle est recommandée."
+      weakness: "Analyse automatique indisponible",
+      pitch: "Contactez ce prospect pour auditer ses besoins digitaux manuellement."
     };
   }
 };
+     } 
+  ;};
